@@ -1,0 +1,7 @@
+mlx>=0.8.0
+transformers
+numpy
+mlx_lm
+numpy
+ipywidgets
+duckdb
