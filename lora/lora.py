@@ -3,9 +3,9 @@
 import argparse
 import json
 import math
-import sys
 import time
 from pathlib import Path
+
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,9 +14,6 @@ import numpy as np
 import utils as lora_utils
 from mlx.utils import tree_flatten
 from models import LoRALinear
-
-# Disable output buffering to see print statements in real-time
-sys.stdout.reconfigure(line_buffering=True)
 
 
 def build_parser():
@@ -192,12 +189,15 @@ def loss(model, inputs, targets, lengths):
 def iterate_batches(dset, tokenizer, batch_size, train=False):
     # Shuffle indices
     while True:
+        # doesn't store the length of the dataset in memory
         indices = np.arange(len(dset))
+
         if train:
             indices = np.random.permutation(indices)
 
-        # Collect batches from dataset
+        # Collect batches from dataset 
         for i in range(0, len(indices) - batch_size + 1, batch_size):
+            start_load = time.perf_counter()                                                                 # ======= DHM =======
             # Encode batch
             batch = [tokenizer.encode(dset[indices[i + j]]) for j in range(batch_size)]
             lengths = [len(x) for x in batch]
@@ -215,7 +215,8 @@ def iterate_batches(dset, tokenizer, batch_size, train=False):
             for j in range(batch_size):
                 batch_arr[j, : lengths[j]] = batch[j]
             batch = mx.array(batch_arr)
-            yield batch[:, :-1], batch[:, 1:], mx.array(lengths)
+            load_time = time.perf_counter() - start_load                                                     # ======= DHM =======
+            yield batch[:, :-1], batch[:, 1:], mx.array(lengths), load_time
 
         if not train:
             break
@@ -228,32 +229,40 @@ def evaluate(model, dataset, loss, tokenizer, batch_size, num_batches):
     # num_batches can be -1 to indicate the entire set
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
-    for it, batch in zip(
+    for it, batch_data in zip(
         index_iterator,
         iterate_batches(dataset, tokenizer, batch_size),
     ):
-        losses, toks = loss(model, *batch)
+        batch, targets, lengths, load_time = batch_data
+        losses, toks = loss(model, batch, targets, lengths)
         all_losses.append((losses * toks).item())
         ntokens += toks.item()
 
     return np.sum(all_losses) / ntokens
 
 
-def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
+def train(model, train_set, val_set, optimizer, loss, tokenizer, args): 
     # Create value and grad function for loss
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
     losses = []
     n_tokens = 0
 
+    total_data_loading_time = 0.0                                                                       # ======= DHM =======              
+    batch_count = 0                                                                                     # ======= DHM =======
+
     # Main training loop
     start = time.perf_counter()
-    for it, batch in zip(
+    for it, batch_data in zip(
         range(args.iters),
         iterate_batches(train_set, tokenizer, args.batch_size, train=True),
     ):
+        batch, targets, lengths, load_time = batch_data                                                  # ======= DHM =======
+        total_data_loading_time += load_time                                                             # ======= DHM =======               
+        batch_count += 1                                                                                 # ======= DHM =======
+        
         # Forward and backward pass
-        (lvalue, toks), grad = loss_value_and_grad(model, *batch)
+        (lvalue, toks), grad = loss_value_and_grad(model, batch, targets, lengths)
 
         # Model update
         optimizer.update(model, grad)
@@ -267,7 +276,7 @@ def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
         if (it + 1) % args.steps_per_report == 0:
             train_loss = np.mean(losses)
 
-            stop = time.perf_counter()
+            stop = time.perf_counter() 
             print(
                 f"Iter {it + 1}: Train loss {train_loss:.3f}, "
                 f"It/sec {args.steps_per_report / (stop - start):.3f}, "
@@ -297,6 +306,11 @@ def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
                 args.adapter_file, **dict(tree_flatten(model.trainable_parameters()))
             )
             print(f"Iter {it + 1}: Saved adapter weights to {args.adapter_file}.")
+        
+    average_loading_time = total_data_loading_time / batch_count                                                        # ======= DHM =======           
+    print(f"Total data loading time: {total_data_loading_time:.6f} seconds")                                            # ======= DHM =======
+    print(f"Average data loading time per batch: {average_loading_time:.6f} seconds")                                   # ======= DHM =======
+
 
 
 def generate(model, prompt, tokenizer, args):
@@ -341,8 +355,8 @@ if __name__ == "__main__":
     # Freeze all layers other than LORA linears
     model.freeze()
     for l in model.model.layers[len(model.model.layers) - args.lora_layers :]:
-        l.self_attn.q_proj = LoRALinear.from_linear(l.self_attn.q_proj)
-        l.self_attn.v_proj = LoRALinear.from_linear(l.self_attn.v_proj)
+        l.self_attn.q_proj = LoRALinear.from_linear(l.self_attn.q_proj, rank=4) #changed rank to 4
+        l.self_attn.v_proj = LoRALinear.from_linear(l.self_attn.v_proj, rank=4) #changed rank to 4
         if hasattr(l, "block_sparse_moe"):
             l.block_sparse_moe.gate = LoRALinear.from_linear(l.block_sparse_moe.gate)
 
@@ -352,7 +366,12 @@ if __name__ == "__main__":
     print(f"Trainable parameters {p:.3f}M")
 
     print("Loading datasets")
+    start_loading_dataset_time = time.perf_counter()                                                     # ======= DHM =======
     train_set, valid_set, test_set = load(args)
+    finish_loading_dataset_time = time.perf_counter()                                                    # ======= DHM =======                      
+    print(
+        f"Loading datasets took {finish_loading_dataset_time - start_loading_dataset_time:.3f}s"         # ======= DHM =======
+    )
 
     # Resume training the given adapters.
     if args.resume_adapter_file is not None:
